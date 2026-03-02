@@ -1,116 +1,252 @@
-import requests
+"""
+test.py — Organizer-side test script
+=====================================
+This script is run by the hackathon organizers to evaluate a participant's
+RAG-based content-moderation system.
+
+It expects:
+  1. The participant's Docker container is running and exposes a FastAPI
+     server on  http://localhost:8000
+  2. The endpoint  POST /analyze  accepts JSON:
+         {"prompt": "<user text>"}
+     and returns JSON:
+         {"harmful": true/false, "articles": ["Article X", ...]}
+     - If harmful is false, "articles" should be an empty list [].
+     - If harmful is true, "articles" lists violated article numbers.
+
+Usage (organizers):
+    docker compose up -d          # start participant container
+    python test.py                # run evaluation
+    docker compose down           # cleanup
+"""
+
+import json
 import time
 import sys
+import requests
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 BASE_URL = "http://localhost:8000"
+ANALYZE_ENDPOINT = f"{BASE_URL}/analyze"
+HEALTH_ENDPOINT = f"{BASE_URL}/health"
+TIMEOUT_SECONDS = 120  # max time to wait per request (LLM can be slow)
+STARTUP_WAIT = 300     # max seconds to wait for container readiness
 
+# ---------------------------------------------------------------------------
+# Test cases: (prompt, expected_harmful, expected_articles_subset)
+#   expected_articles_subset: if harmful, at least these articles should appear
+# ---------------------------------------------------------------------------
 TEST_CASES = [
+    # --- Harmful prompts (should detect CCPA violation) ---
     {
-        "name": "Exemption Applied (Trade Secrets)",
-        "prompt": "A consumer submitted a verifiable request to know the specific pieces of data we collected. We provided their data, but refused to disclose the proprietary algorithm and trade secrets we used to calculate their internal user score.",
-        "expect_harmful": False
-        # Safe under Section 1798.100(f) (Trade Secret Exemption)
+        "prompt": "We are selling our customers' personal information to third-party data brokers without informing them or giving them a chance to opt out.",
+        "expected_harmful": True,
+        "expected_articles_subset": [],  # organizers fill with correct section(s)
+        "description": "Selling personal info without opt-out (Sec 1798.120)"
     },
     {
-        "name": "Sensitive Data Violation (Biometrics)",
-        "prompt": "Our physical gym locations collect fingerprint scans to uniquely identify members for entry. We do not provide any 'Limit the Use of My Sensitive Personal Information' notices or links.",
-        "expect_harmful": True
-        # Should flag Section 1798.121 or 1798.135
+        "prompt": "Our company collects browsing history, geolocation, and biometric data from users but our privacy policy doesn't mention any of this.",
+        "expected_harmful": True,
+        "expected_articles_subset": [],
+        "description": "Undisclosed data collection (Sec 1798.100)"
     },
     {
-        "name": "Exemption Applied (Educational Assessment)",
-        "prompt": "A high school student requested that we delete their SAT scores and standardized test responses that we process and hold on behalf of their school district. We denied the deletion request.",
-        "expect_harmful": False
-        # Safe under Section 1798.145(q) (Educational Assessment Exemption)
+        "prompt": "A customer asked us to delete their data but we are ignoring their request and keeping all records.",
+        "expected_harmful": True,
+        "expected_articles_subset": [],
+        "description": "Ignoring deletion request (Sec 1798.105)"
     },
     {
-        "name": "Clear Violation (Dark Patterns)",
-        "prompt": "We provide a 'Do Not Sell My Personal Information' link, but clicking it opens a confusing popup with inverted colors, a 30-second unskippable countdown timer, and language that implies their account will be deleted if they proceed.",
-        "expect_harmful": True
-        # Should flag Section 1798.135 (Opt-out procedures / Dark Patterns)
+        "prompt": "We charge customers who opted out of data selling a higher price for the same service.",
+        "expected_harmful": True,
+        "expected_articles_subset": [],
+        "description": "Discriminatory pricing for opt-out (Sec 1798.125)"
     },
     {
-        "name": "Clear Violation (Right to Know Sources)",
-        "prompt": "A consumer submitted a verifiable request asking for the categories of sources from which we collected their personal information. We told them we only have to disclose the data itself, not where we bought it from.",
-        "expect_harmful": True
-        # Should flag Section 1798.110 (Right to Know Categories of Sources)
-    }
+        "prompt": "We are collecting and selling personal data of 14-year-old users without getting their parent's consent.",
+        "expected_harmful": True,
+        "expected_articles_subset": [],
+        "description": "Minor's data without consent (Sec 1798.120)"
+    },
+    # --- Safe prompts (should NOT detect violation) ---
+    {
+        "prompt": "Our company provides a clear privacy policy and allows customers to opt out of data selling at any time.",
+        "expected_harmful": False,
+        "expected_articles_subset": [],
+        "description": "CCPA-compliant data practices"
+    },
+    {
+        "prompt": "We deleted all personal data within 45 days after receiving the consumer's verified request.",
+        "expected_harmful": False,
+        "expected_articles_subset": [],
+        "description": "Proper deletion compliance"
+    },
+    {
+        "prompt": "Can we schedule a team meeting for next Monday to discuss the project?",
+        "expected_harmful": False,
+        "expected_articles_subset": [],
+        "description": "Normal meeting request (unrelated to CCPA)"
+    },
+    {
+        "prompt": "Our website has a 'Do Not Sell My Personal Information' link on the homepage as required.",
+        "expected_harmful": False,
+        "expected_articles_subset": [],
+        "description": "Proper opt-out link (compliant)"
+    },
+    {
+        "prompt": "We provide equal service and pricing to all customers regardless of whether they exercise their privacy rights.",
+        "expected_harmful": False,
+        "expected_articles_subset": [],
+        "description": "Non-discriminatory practices (compliant)"
+    },
 ]
 
-def check_health():
-    print("⏳ Waiting for API to become ready (Checking /health)...")
-    max_retries = 30
-    for i in range(max_retries):
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def wait_for_server(url: str, timeout: int = STARTUP_WAIT) -> bool:
+    """Block until the participant server is healthy or timeout."""
+    print(f"⏳ Waiting for server at {url} (max {timeout}s) ...")
+    start = time.time()
+    while time.time() - start < timeout:
         try:
-            response = requests.get(f"{BASE_URL}/health", timeout=2)
-            if response.status_code == 200 and response.json().get("status") == "ready":
-                print("✅ API is healthy and ready!\n")
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                print("✅ Server is up!\n")
                 return True
-        except requests.exceptions.ConnectionError:
+        except requests.ConnectionError:
             pass
-        
-        time.sleep(2)
-        sys.stdout.write(".")
-        sys.stdout.flush()
-        
-    print("\n❌ API Health Check Failed. Did you start the server?")
+        time.sleep(5)
+    print("❌ Server did not become ready in time.")
     return False
 
-def test_analyze_endpoint():
-    passed = 0
-    total = len(TEST_CASES)
-    
-    for i, test in enumerate(TEST_CASES, 1):
-        print(f"--- Test {i}/{total}: {test['name']} ---")
-        payload = {"prompt": test["prompt"]}
-        
+
+def validate_response(resp_json: dict) -> list[str]:
+    """Return list of validation errors for a single response."""
+    errors = []
+    if not isinstance(resp_json, dict):
+        errors.append(f"Response is not a JSON object: {type(resp_json)}")
+        return errors
+    if "harmful" not in resp_json:
+        errors.append("Missing key 'harmful'")
+    elif not isinstance(resp_json["harmful"], bool):
+        errors.append(f"'harmful' should be bool, got {type(resp_json['harmful'])}")
+    if "articles" not in resp_json:
+        errors.append("Missing key 'articles'")
+    elif not isinstance(resp_json["articles"], list):
+        errors.append(f"'articles' should be list, got {type(resp_json['articles'])}")
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Main evaluation loop
+# ---------------------------------------------------------------------------
+def run_tests() -> dict:
+    results = {
+        "total": len(TEST_CASES),
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "details": []
+    }
+
+    for idx, tc in enumerate(TEST_CASES, 1):
+        prompt = tc["prompt"]
+        desc = tc["description"]
+        expected_harmful = tc["expected_harmful"]
+        print(f"── Test {idx}/{len(TEST_CASES)}: {desc}")
+        print(f"   Prompt : {prompt[:80]}...")
+
+        detail = {"test": idx, "description": desc, "status": "UNKNOWN"}
+
         try:
-            # The judges usually set a 30-60 second timeout for LLM generation
-            response = requests.post(f"{BASE_URL}/analyze", json=payload, timeout=300)
-            
-            if response.status_code != 200:
-                print(f"❌ FAIL: API returned status code {response.status_code}")
-                print(response.text)
-                continue
-                
-            data = response.json()
-            print(f"Output: {data}")
-            
-            # 1. Format Validation (The most important part)
-            if "harmful" not in data or "articles" not in data:
-                print("❌ FAIL: Missing required JSON keys ('harmful' or 'articles').")
-                continue
-                
-            if not isinstance(data["harmful"], bool):
-                print("❌ FAIL: 'harmful' must be a boolean.")
-                continue
-                
-            if not isinstance(data["articles"], list):
-                print("❌ FAIL: 'articles' must be a list.")
-                continue
-                
-            # 2. Logic Validation
-            if data["harmful"] is False and len(data["articles"]) > 0:
-                print("❌ FAIL: 'articles' list must be EMPTY when harmful is False.")
-                continue
-                
-            print("✅ PASS: Format is perfectly valid.")
-            passed += 1
-            
+            resp = requests.post(
+                ANALYZE_ENDPOINT,
+                json={"prompt": prompt},
+                timeout=TIMEOUT_SECONDS,
+            )
+            resp.raise_for_status()
+            resp_json = resp.json()
         except requests.exceptions.Timeout:
-            print("❌ FAIL: Request timed out. The LLM took too long.")
+            detail["status"] = "ERROR"
+            detail["error"] = "Request timed out"
+            results["errors"] += 1
+            results["details"].append(detail)
+            print(f"   ❌ ERROR: Timeout\n")
+            continue
         except Exception as e:
-            print(f"❌ FAIL: Unexpected error: {e}")
-            
-        print("")
+            detail["status"] = "ERROR"
+            detail["error"] = str(e)
+            results["errors"] += 1
+            results["details"].append(detail)
+            print(f"   ❌ ERROR: {e}\n")
+            continue
 
-    print("========================================")
-    print(f"🏁 Final Score: {passed}/{total} Format Tests Passed")
-    if passed == total:
-        print("🏆 YOUR API IS READY FOR SUBMISSION!")
-    else:
-        print("⚠️ Fix the errors before building Docker.")
+        # Validate response structure
+        v_errors = validate_response(resp_json)
+        if v_errors:
+            detail["status"] = "FAIL"
+            detail["validation_errors"] = v_errors
+            results["failed"] += 1
+            results["details"].append(detail)
+            print(f"   ❌ FAIL: Validation errors: {v_errors}\n")
+            continue
 
+        detail["response"] = resp_json
+
+        # Check harmful correctness
+        got_harmful = resp_json["harmful"]
+        if got_harmful != expected_harmful:
+            detail["status"] = "FAIL"
+            detail["reason"] = (
+                f"Expected harmful={expected_harmful}, got harmful={got_harmful}"
+            )
+            results["failed"] += 1
+            print(f"   ❌ FAIL: {detail['reason']}")
+        else:
+            # If harmful, check that articles list is non-empty
+            if expected_harmful and len(resp_json.get("articles", [])) == 0:
+                detail["status"] = "FAIL"
+                detail["reason"] = "harmful=true but articles list is empty"
+                results["failed"] += 1
+                print(f"   ❌ FAIL: {detail['reason']}")
+            elif not expected_harmful and len(resp_json.get("articles", [])) > 0:
+                detail["status"] = "FAIL"
+                detail["reason"] = "harmful=false but articles list is non-empty"
+                results["failed"] += 1
+                print(f"   ❌ FAIL: {detail['reason']}")
+            else:
+                detail["status"] = "PASS"
+                results["passed"] += 1
+                print(f"   ✅ PASS")
+
+        print(f"   Response: {json.dumps(resp_json)}\n")
+        results["details"].append(detail)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Entry-point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    if check_health():
-        test_analyze_endpoint()
+    if not wait_for_server(HEALTH_ENDPOINT):
+        sys.exit(1)
+
+    results = run_tests()
+
+    print("=" * 60)
+    print(f"RESULTS: {results['passed']}/{results['total']} passed, "
+          f"{results['failed']} failed, {results['errors']} errors")
+    print("=" * 60)
+
+    # Dump full results to file
+    with open("test_results.json", "w") as f:
+        json.dump(results, f, indent=2)
+    print("📄 Detailed results saved to test_results.json")
+
+    # Exit code: 0 if all passed
+    sys.exit(0 if results["failed"] == 0 and results["errors"] == 0 else 1)

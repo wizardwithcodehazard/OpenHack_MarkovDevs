@@ -42,15 +42,9 @@ ENV PYTHONUNBUFFERED=1
 
 # HF cache lives inside /workspace so it's baked into the image layer
 ENV HF_HOME=/workspace/.cache/huggingface
-ENV HUGGINGFACE_HUB_CACHE=/workspace/.cache/huggingface
 
 # ── Copy scripts and download models NOW (at build time) ──────────────────
 COPY scripts/ /workspace/scripts/
-
-# Accept HF_TOKEN as build arg (only needed for gated models; our models are public)
-ARG HF_TOKEN=""
-ENV HF_TOKEN=${HF_TOKEN}
-
 RUN python scripts/04_download_model.py
 
 # ── Copy data (pre-built graph + FAISS index) ─────────────────────────────
@@ -59,7 +53,7 @@ COPY data/ /workspace/data/
 # ── Copy application source ────────────────────────────────────────────────
 COPY app/ /workspace/app/
 
-# ── Expose port ────────────────────────────────────────────────────────────
+# ── Expose port (Mandatory for Hackathon) ──────────────────────────────────
 EXPOSE 8000
 
 # ── Health check so orchestrators know when the model is loaded ────────────
